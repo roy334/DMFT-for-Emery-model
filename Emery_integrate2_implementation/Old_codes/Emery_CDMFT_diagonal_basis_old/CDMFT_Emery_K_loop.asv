@@ -1,0 +1,156 @@
+%% CDMFT for the Emery model: 2x2 Cu plaquette, CLUSTER-MOMENTUM (K) basis
+
+% Oxygens integrated out:  G0eff^-1(z,k) = z - ed - W(z,k),  t_cl = ed*1.
+% In the K basis  d_K = sum_a U_aK d_a,  U = 1/2*[1 1 1 1; 1 1 -1 -1; 1 -1 1 -1; 1 -1 -1 1],
+% the hybridization Delta_K(w) is diagonal -> four independent Wilson chains.
+%   columns / channels: K = (0,0), (pi,0), (0,pi), (pi,pi)
+%   sites:              F1=(0,0), F2=(0,1), F3=(1,0), F4=(1,1)
+%
+% Lattice step, directly in the K basis (W rotated once, no per-iteration rotations):
+%   W_K(z,k~)  = U*W_mix(z,k~)*U            (WK_matrix.m; NOT diagonal at fixed k~)
+%   G_K(w)     = < [ (z-ed)1 - W_K(z,k~) - diag(Sigma_K) ]^-1 >_k~ ,  diagonal elements
+%   Delta_K    = z - ed - Sigma_K - 1/G_K
+% Fixed mu.
+
+
+clear
+num_threads_SL(8);
+
+%% Step 1. Parameters, frequency grid, lattice kernel in the K basis
+P  = struct('ed',0,'ep',8,'tpd',1.5,'tpp',1,'tpp2',1);  % Sordi et al. Eq.(16); diag = ep-2tpp+2tpp2 cos k
+U  = 11.1;           % Hubbard U on Cu
+mu = 10;             % fixed chemical potential
+T  = 1/40;           % temperature
+Nc = 4;
+
+% The SAME grid options must be passed to impSE ('getAcont')
+optAcont = {'emax',25};                  % must cover ~[-15,10] around mu
+ocont    = getAcont(0,0,0,0,optAcont{:});
+Noc      = numel(ocont);
+
+
+% lattice step in the K basis: Ek = 0; oxygen kernel rotated once, W_K = U*W_mix*U.
+% integrateG passes w = ocont + 1i*iReg, so W is evaluated at z = w + mu.
+Ek = cell(4,4);  Fkw = cell(4,4);
+for a = 1:4
+   for b = 1:4
+      Ek{a,b}  = @(kx,ky) 0*kx;
+      Fkw{a,b} = @(kx,ky,w) pickElem(WK_matrix(kx,ky,w+mu,P),a,b);
+   end
+end
+iReg = 1e-4;
+% 'diag': full 4x4 inversion at each k~, but only the diagonal of G_K is integrated
+% (complex integration; the off-diagonal elements vanish after the k~-average).
+intopt = {'Fkw',Fkw,'Hloc',P.ed-mu,'CDMFT','diag','N',1/pi^2,'iReg',iReg,'AbsTol',1e-6,'RelTol',1e-4};
+
+%% Step 2. Starting hybridization (K basis, Noc x 4)
+% startHyb = 'metallic' : non-interacting (Sigma = 0) hybridization, evaluated at a
+%                         reference chemical potential mu0 (mu0 = mu: U = 0 bath at the
+%                         actual mu; mu0 inside the Cu-like band: generic metallic bath,
+%                         as in the DCA example scripts)
+% startHyb = 'hubbardI' : Hubbard-I self-energy with n_d determined self-consistently
+%                         at this mu (targets the insulating / pseudogap branch)
+startHyb = 'metallic';
+mu0      = mu;                           % only used for 'metallic'
+
+fpath = [go('mu'),'/DMFT/Emery_CDMFT'];
+fname = @(n) [fpath,'/CDMFT_Emery_K_U',num2str(U),'_mu',num2str(mu),'_T',num2str(T),'_',num2str(n),'.mat'];
+N2 = 1;                                  % run counter
+if N2 == 1
+   switch startHyb
+      case 'metallic'
+         % U = 0 lattice step at mu0
+         Fkw0 = cell(4,4);
+         for a = 1:4
+            for b = 1:4
+               Fkw0{a,b} = @(kx,ky,w) pickElem(WK_matrix(kx,ky,w+mu0,P),a,b);
+            end
+         end
+         intopt0 = {'Fkw',Fkw0,'Hloc',P.ed-mu0,'CDMFT','diag','N',1/pi^2,'iReg',iReg,'AbsTol',1e-6,'RelTol',1e-4};
+         Rhoin = latticeK(ocont,zeros(Noc,Nc),Ek,intopt0);       % Noc x 4
+
+      case 'hubbardI'
+         % cheaper integration settings for the seed iterations only
+         intopt_seed = {'Fkw',Fkw,'Hloc',P.ed-mu,'CDMFT','diag','N',1/pi^2, ...
+                        'iReg',1e-3,'AbsTol',1e-5,'RelTol',1e-3};
+         [SE0,nd0] = hiSeed(ocont,mu,P,U,T,Ek,intopt_seed,1.0);
+         Rhoin = latticeK(ocont,SE0,Ek,intopt);                  % Noc x 4
+
+      otherwise
+         error('ERR: startHyb must be ''metallic'' or ''hubbardI''.');
+   end
+   RhoV2_arr = [];  nd = [];
+else
+   load(fname(N2-1),'Rhoin','nd');
+   Rhoin = Rhoin(:,:,end);  RhoV2_arr = [];
+end
+
+%% Step 3. Impurity Hamiltonian (K basis) and NRG parameters
+% H_imp = (ed-mu)*N + U*sum_i n_i,up n_i,dn ; Wilson chains attach to FK = U*FF
+[Hmu,HU,~,A0,~,ZF,~,~,~,FK,NK] = Emery_Plaquette_U1xSU2(U,mu,P.ed,'-iso2HU');
+
+Gdep = [1 2 2 3];  Fdep = Gdep;          % diagonal self-energy; (pi,0) and (0,pi) identical
+inrg = 1:Nc;                             % interleave the four independent chains
+
+Lambda  = 4;
+nz      = 2;
+nrgdata = [getenv('SCRATCH_DIR'),'/Emery_K'];
+Nkeep   = 5000;
+NKEEP   = 3*Nkeep*ones(1,3);
+Etrunc  = 9;
+
+%% Step 4. DMFT cycle
+Nmax  = 40;
+iscvg = false;
+while (iscvg == false) && (size(Rhoin,3) < Nmax)
+   % 4.1 impurity: four diagonal channels -> SE(:,K)
+   [ocont_imp,SE,nrgdataz] = impSE(Hmu,HU,A0,FK,ZF,Rhoin(:,:,end),T,Lambda,nz,Nkeep,nrgdata, ...
+      'inrg',inrg,'Gdep',Gdep,'Fdep',Fdep,'broaden','adap','numCorr',3, ...
+      'getAcont',optAcont, ...
+      'doZLD',{'emin',1e-33,'minTE',1e-8}, ...
+      'NRG_SL',{'Etrunc',Etrunc,'NKEEP',NKEEP}, ...
+      'SEtrick',{'iSEmax',-1e-8});
+   if numel(ocont_imp) ~= Noc || any(abs(ocont_imp(:)-ocont(:)) > 1e-12)
+      error('ERR: impSE frequency grid differs from the lattice grid; check optAcont.');
+   end
+   SE(:,[2 3]) = repmat(mean(SE(:,[2 3]),2),1,2);    % enforce (pi,0) = (0,pi)
+   nd = cat(2,nd,getEpVal(nrgdataz,sum(NK))/Nc);    % Cu filling per site
+
+   % 4.2 lattice step in the K basis
+   RhoV2 = latticeK(ocont,SE,Ek,intopt);
+   RhoV2_arr = cat(3,RhoV2_arr,RhoV2);
+
+   % 4.3 update hybridization at fixed mu (x = 3: iterations along dim 3)
+   [iscvg,Rho_new] = updateHyb(Rhoin,RhoV2_arr,3,'Broyden',2,'amix',0.9,'ocont',ocont,'-v');
+   if ~iscvg
+      Rhoin = cat(3,Rhoin,Rho_new);
+   end
+
+   save(fname(N2),'-v7.3');
+end
+
+%% ------------------------------------------------------------------------
+function RhoV2 = latticeK(ocont,SEK,Ek,intopt)
+% CDMFT lattice step in the K basis with a K-diagonal self-energy SEK (Noc x 4).
+% Returns RhoV2_K = -Im Delta_K / pi (Noc x 4), (pi,0)=(0,pi) enforced.
+[RhoV2m,~,~,~] = integrateG(Ek,[0 0],[pi pi],ocont,intopt{:},'SE',SEK);
+RhoV2 = real([RhoV2m(:,1,1) RhoV2m(:,2,2) RhoV2m(:,3,3) RhoV2m(:,4,4)]);
+RhoV2(:,[2 3]) = repmat(mean(RhoV2(:,[2 3]),2),1,2);
+end
+
+function [SE0,nd0] = hiSeed(ocont,mu,P,U,T,Ek,intopt,nd0)
+% Hubbard-I seed with n_d determined self-consistently at fixed mu.
+% Sigma_HI(z; n_d) is local -> identical on all four K channels.
+fw   = 1./(exp(ocont(:)/T)+1);           % ocont is measured from mu
+eta0 = 0.05;  z = ocont(:) + 1i*eta0 + mu;
+for it = 1:30
+   Gat = (1-nd0/2)./(z-P.ed) + (nd0/2)./(z-P.ed-U);
+   SE0 = repmat(z - P.ed - 1./Gat, 1, 4);
+   [~,~,~,G] = integrateG(Ek,[0 0],[pi pi],ocont,intopt{:},'SE',SE0);
+   AK = -imag([G(:,1,1) G(:,2,2) G(:,3,3) G(:,4,4)])/pi;
+   nd_new = 2*mean(trapz(ocont(:), fw.*AK));
+   fprintf('HI seed: it %2d  nd_in = %.4f  nd_out = %.4f\n', it, nd0, nd_new);
+   if abs(nd_new - nd0) < 1e-3, break; end
+   nd0 = 0.5*nd0 + 0.5*nd_new;
+end
+end
