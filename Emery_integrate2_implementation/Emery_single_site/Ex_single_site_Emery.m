@@ -17,7 +17,7 @@ num_threads_SL(8);
 
 %% Step 1: Model parameters (Sordi et al., PRB 111, 045117)
 
-P = struct('ed',0,'ep',2.8,'tpd',2,'tpp',1,'tpp2',0.2);   % oxygen diagonal: ep - 2tpp + 2tpp2 cos k
+P = struct('ed',0,'ep',8,'tpd',1.5,'tpp',1,'tpp2',1);   % oxygen diagonal: ep - 2tpp + 2tpp2 cos k
 
 % Lattice step: emery_lattice_asymest.m (2D k-integration with the asymmetric
 % estimator). No static Cu-Cu hopping: the impurity level is ed - mu, and nothing
@@ -40,9 +40,9 @@ removeSEeta = true;   % after convergence: occupations/spectra without SEeta (ph
 
 %% Step 2: Impurity hamiltonian, initial hybridization and NRG parameters
 
-U  = 12;       % Cu interaction strength
+U  = 11.1;       % Cu interaction strength
 T  = 0.05;       % temperature
-mu = 7;         % fixed chemical potential
+mu = 10;         % fixed chemical potential
 
 % Choice of starting hybridization (only used if Nrun == 0):
 %   'metallic' : non-interacting hybridization (Sigma = 0), evaluated at mu0
@@ -52,6 +52,15 @@ mu = 7;         % fixed chemical potential
 %                This is the starting guess of Vucicevic & Zitko, arXiv:2604.08085,
 %                Sec. III.B, step 1 (they report that Sigma_dd = 0 converges poorly).
 
+Lambda  = 4;     % discretization parameter
+nz      = 2;     % number of z-shifts
+nrgdata = [getenv('SCRATCH_DIR'),'/'];   % path to save NRG data (HDD mode)
+Nkeep   = 5000;  % kept states at each step of iterative diagonalization
+NKEEP   = 3*Nkeep*ones(1,3);   % kept states for the first three chain sites
+Etrunc  = 10;    % truncation energy
+dz      = 1e-4/nz;   % finite-difference step of doZLD's differential Hamiltonian
+                     % (default 0.01/nz); smaller -> avoids H1/H2 size
+                     % mismatch. H1 from rep1TE, H2 from rep2TE in doZLD
 
 startHyb = 'hubbardI';
 mu0      = mu;   % reference mu for 'metallic' (e.g. 8.65: U = 0, n_tot = 5)
@@ -61,7 +70,7 @@ Nrun = 0; % Nrun = 0: no previous run, set up the initial hybridization.
           % Nrun > 0: load the hybridization of run Nrun-1 and continue.
 
 fname = @(n) [go('mu'),'/DMFT/Emery_code/Emery_integrate2_implementation/Emery_single_site/Ex_single_site_Emery_U_',num2str(U), ...
-              '_mu_',num2str(mu),'_T_',num2str(T),'_ep_',num2str(P.ep),'_tpd_',num2str(P.tpd),'_tpp2_',num2str(P.tpp2), '_',startHyb,'_',num2str(n),'_SEeta2pole.mat'];
+              '_mu_',num2str(mu),'_T_',num2str(T),'_ep_',num2str(P.ep),'_tpd_',num2str(P.tpd),'_tpp2_',num2str(P.tpp2), '_',startHyb,'_',num2str(n),'_SEeta2pole_Lambda_',num2str(Lambda),'_nz_',num2str(nz),'_.mat'];
 
 if Nrun == 0
 
@@ -127,15 +136,7 @@ end
 % level ed - mu (t_cl = ed: no static hopping in the Emery model)
 [Hmu,HU,~,A0,FF,ZF,SF,EF,NF] = SIAM('Acharge,SU2spin',U,mu,P.ed,'-iso2HU');
 
-Lambda  = 2;     % discretization parameter
-nz      = 2;     % number of z-shifts
-nrgdata = [getenv('SCRATCH_DIR'),'/'];   % path to save NRG data (HDD mode)
-Nkeep   = 1000;  % kept states at each step of iterative diagonalization
-NKEEP   = 3*Nkeep*ones(1,3);   % kept states for the first three chain sites
-Etrunc  = 10;    % truncation energy
-dz      = 1e-4/nz;   % finite-difference step of doZLD's differential Hamiltonian
-                     % (default 0.01/nz); smaller -> avoids H1/H2 size
-                     % mismatch. H1 from rep1TE, H2 from rep2TE in doZLD
+
 
 
 minRho = 0;  % Do not clip off the edges of the hybridization, instead, fix a large window of [-emax,+emax]
@@ -192,10 +193,11 @@ while size(Rhoin,2) < N
 
 
     % Step 3.2: NRG impurity solver -> self-energy
-    [ocont,SE,nrgdataz] = impSE(Hmu,HU,A0,FF,ZF,Rhoin(:,end),T,Lambda,nz,Nkeep,nrgdata,'numCorr',3, ...
-                          'Nchain',Nchain, ...
-                          'doZLD',{'emax',Emax,'emin',Emin,'minrho',minRho,'minTE',minTE,'dz',dz},'NRG_SL',{'Etrunc',Etrunc,'NKEEP',NKEEP},'SEtrick',{'iSEmax',-1e-8});
-
+    [ocont,SE,nrgdataz] = impSE(Hmu,HU,A0,FF,ZF,Rhoin(:,end),T,Lambda,nz,Nkeep,nrgdata, ...
+                      'broaden','adap','numCorr',3, ...
+                      'Nchain',Nchain, ...
+                      'doZLD',{'emax',Emax,'emin',Emin,'minrho',minRho,'minTE',minTE,'dz',dz}, ...
+                      'NRG_SL',{'Etrunc',Etrunc,'NKEEP',NKEEP},'SEtrick',{'iSEmax',-1e-8});
     nd = cat(2,nd,getEpVal(nrgdataz,NF));   % Cu occupation <n_d> at each iteration
 
     % Step 3.3: lattice step: 2D k-integration of the local Cu Green's function G
@@ -213,7 +215,7 @@ while size(Rhoin,2) < N
     % Step 3.4: update hybridization at fixed mu (pointwise convergence criterion)
     % amix = 0.5 (was 0.9): damps the Broyden overshoots seen at sharp features
     
-    [~,Rhoin_new] = updateHyb(Rhoin,RhoV2_arr,2,'cvgth',0.005,'Broyden',2,'amix',0.5,'-v');  % Note that here, iscvg is not needed because of the Wasserstein norm
+    [~,Rhoin_new] = updateHyb(Rhoin,RhoV2_arr,2,'cvgth',0,'Broyden',2,'amix',0.5); % Note that here, iscvg is not needed because of the Wasserstein norm
 
     Rhoin_new = max(Rhoin_new, 0);       % a hybridization function must be >= 0 (set by hand)
     Rhoin = cat(2,Rhoin,Rhoin_new);
